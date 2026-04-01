@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Mario Kart - ML5 Edition</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@latest/lib/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ml5@latest/dist/ml5.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #060810;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      min-height: 100vh; font-family: 'Courier New', monospace;
+    }
+    canvas { display: block; border: 3px solid #ff6b00; box-shadow: 0 0 60px #ff6b0088, 0 0 120px #ff6b0033; }
+    #capture-canvas { display: none; }
+    #hud-label { color: #ff6b00; font-size: 11px; text-align: center; margin-top: 8px; letter-spacing: 3px; opacity: 0.6; }
+  </style>
+</head>
+<body>
+<canvas id="capture-canvas" width="160" height="120"></canvas>
+<div id="hud-label">✋ MANO ABIERTA = IZQ &nbsp;·&nbsp; ✊ PUÑO = DER &nbsp;·&nbsp; ✚ CRUZ = FRENAR</div>
+
+<script>
+const W = 800, H = 600;
+const MODEL_URL = 'https://teachablemachine.withgoogle.com/models/ZpKc-4XCi/';
+const TOTAL_LAPS = 3;
+
+let classifier, video, captureCanvas, captureCtx;
+let currentLabel = "Nada", confidence = 0;
+let modelReady = false;
+let gameState = 'loading'; // 'loading'|'countdown'|'playing'|'finished'
+let countdownValue = 3, countdownTimer = 0;
+
+// ── Tiempo ──
+let lapStartTime = 0, lapTimes = [], bestLapTime = Infinity, finalPosition = 1;
+
+// ── Pista ──
+const TRACK_CTRL = [
+  {x:400,y:120},{x:670,y:140},{x:720,y:240},{x:710,y:420},
+  {x:580,y:510},{x:400,y:540},{x:220,y:510},
+  {x:90,y:420},{x:80,y:240},{x:130,y:140},
+];
+const TRACK_WIDTH = 80;
+let TRACK_PTS = [];
+
+// ── Kart ──
+const START_X=400, START_Y=150, START_ANGLE=0;
+let kart = {
+  x:START_X, y:START_Y, angle:START_ANGLE, speed:0,
+  maxSpeed:5, acceleration:0.12, friction:0.96,
+  turnSpeed:0.045, width:28, height:18, onTrack:true,
+  trackIndex:0, lapCount:0, lastCheckpoint:false,
+};
+
+// ── Rivales ──
+const RIVAL_DEFS = [
+  { maxSpeed:3.8, col:[30,120,255],  num:'2' },
+  { maxSpeed:3.2, col:[80,200,60],   num:'3' },
+  { maxSpeed:4.2, col:[220,180,0],   num:'4' },
+];
+let rivals=[], particles=[];
+
+// ── Variables visuales ──
+let lapFlash = 0;      // flash al completar vuelta
+let offTrackShake = 0; // vibración al salir de pista
+let treePositions = []; // árboles decorativos
+
+// ─────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────
+function setup() {
+  createCanvas(W, H);
+  angleMode(RADIANS); rectMode(CENTER); ellipseMode(CENTER);
+  textFont('monospace');
+  TRACK_PTS = buildTrackPoints(120);
+  initRivals();
+  generateDecorations();
+  captureCanvas = document.getElementById('capture-canvas');
+  captureCtx    = captureCanvas.getContext('2d');
+  video = createCapture(VIDEO);
+  video.size(160,120); video.hide();
+  initML();
+}
+
+function generateDecorations() {
+  // Árboles dentro del óvalo interior
+  randomSeed(77);
+  treePositions = [];
+  for (let i=0; i<18; i++) {
+    let angle = random(TWO_PI);
+    let rx = random(60,190), ry = random(60,140);
+    let tx = 400 + cos(angle)*rx;
+    let ty = 335 + sin(angle)*ry;
+    treePositions.push({ x:tx, y:ty, size:random(6,14), type:floor(random(2)) });
+  }
+}
+
+function initRivals() {
+  rivals=[];
+  let n=TRACK_PTS.length;
+  for (let i=0; i<RIVAL_DEFS.length; i++) {
+    let def=RIVAL_DEFS[i];
+    let idx=((0-(i+1)*4)+n)%n;
+    let pt=TRACK_PTS[idx], nextPt=TRACK_PTS[(idx+1)%n];
+    rivals.push({
+      x:pt.x, y:pt.y,
+      angle:atan2(nextPt.y-pt.y, nextPt.x-pt.x),
+      speed:0, maxSpeed:def.maxSpeed,
+      targetIdx:(idx+1)%n,
+      col:def.col, num:def.num,
+      lapCount:0, trackIndex:idx,
+      width:28, height:18, finished:false,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  ML5
+// ─────────────────────────────────────────────
+async function initML() {
+  try {
+    classifier = await ml5.imageClassifier(MODEL_URL+'model.json');
+    await waitForVideo();
+    modelReady=true; captureLoop(); classifyLoop();
+    startCountdown();
+  } catch(e) { console.error('Error:',e); }
+}
+function waitForVideo() {
+  return new Promise(r => {
+    if (video.elt.readyState>=2) r();
+    else video.elt.addEventListener('loadeddata',r,{once:true});
+  });
+}
+function captureLoop() {
+  if (video.elt.readyState>=2) captureCtx.drawImage(video.elt,0,0,160,120);
+  requestAnimationFrame(captureLoop);
+}
+async function classifyLoop() {
+  while (modelReady) {
+    try {
+      let imageData=captureCtx.getImageData(0,0,160,120);
+      let results=await classifier.classify(imageData);
+      currentLabel=results[0].label.trim();
+      confidence=results[0].confidence;
+    } catch(e) {}
+    await new Promise(r=>setTimeout(r,50));
+  }
+}
+
+// ─────────────────────────────────────────────
+//  ESTADO
+// ─────────────────────────────────────────────
+function startCountdown() {
+  gameState='countdown'; countdownValue=3; countdownTimer=millis();
+  lapStartTime=0; lapTimes=[]; bestLapTime=Infinity;
+}
+function startRace() {
+  gameState='playing'; lapStartTime=millis();
+}
+function resetGame() {
+  kart.x=START_X; kart.y=START_Y; kart.angle=START_ANGLE;
+  kart.speed=0; kart.onTrack=true; kart.lapCount=0;
+  kart.lastCheckpoint=false; kart.trackIndex=0;
+  particles=[]; lapFlash=0; offTrackShake=0;
+  initRivals(); startCountdown();
+}
+
+// ─────────────────────────────────────────────
+//  DRAW
+// ─────────────────────────────────────────────
+function draw() {
+  if (gameState==='loading') { drawLoadingScreen(); return; }
+
+  // Shake si está fuera de pista
+  let sx=0, sy=0;
+  if (!kart.onTrack && gameState==='playing') {
+    offTrackShake = min(offTrackShake+0.3, 3);
+    sx = random(-offTrackShake, offTrackShake);
+    sy = random(-offTrackShake, offTrackShake);
+  } else {
+    offTrackShake *= 0.9;
+  }
+
+  push();
+  translate(sx, sy);
+  drawBackground();
+  drawTrack();
+  drawFinishLine();
+  updateAndDrawParticles();
+
+  if (gameState==='playing') {
+    updateKart(); updateRivals(); checkCollisions();
+    lapFlash *= 0.92; // fade del flash
+  }
+
+  for (let r of rivals) drawRival(r);
+  drawKart();
+  pop();
+
+  drawHUD();
+  drawCameraFeed();
+  drawGestureLabel();
+  drawResetButton();
+
+  // Flash verde al completar vuelta
+  if (lapFlash > 0.05) {
+    noStroke(); fill(100,255,100, lapFlash*60);
+    rect(W/2,H/2,W,H);
+  }
+
+  if (gameState==='countdown') {
+    drawCountdown();
+    let elapsed=millis()-countdownTimer;
+    let newVal=3-floor(elapsed/1000);
+    if (newVal<=0) startRace(); else countdownValue=newVal;
+  }
+  if (gameState==='finished') drawFinishScreen();
+}
+
+// ─────────────────────────────────────────────
+//  KART UPDATE
+// ─────────────────────────────────────────────
+function updateKart() {
+  let label=(confidence>0.7)?currentLabel:"Nada";
+  let turningLeft=(label==="Mizquierda");
+  let turningRight=(label==="Mderecha");
+  let braking=(label==="frenar");
+
+  if (keyIsDown(DOWN_ARROW)||keyIsDown(83))  braking=true;
+  if (keyIsDown(LEFT_ARROW)||keyIsDown(65))  turningLeft=true;
+  if (keyIsDown(RIGHT_ARROW)||keyIsDown(68)) turningRight=true;
+
+  if (!braking) kart.speed+=kart.acceleration*(kart.onTrack?1:0.4);
+  else          kart.speed-=kart.acceleration*2.5;
+
+  kart.speed*=kart.friction;
+  if (!kart.onTrack) kart.speed*=0.96;
+  kart.speed=constrain(kart.speed,0,kart.maxSpeed);
+
+  if (kart.speed>0.1) {
+    let turn=kart.turnSpeed*(kart.speed/kart.maxSpeed);
+    if (turningLeft)       kart.angle-=turn;
+    else if (turningRight) kart.angle+=turn;
+  }
+
+  kart.x+=cos(kart.angle)*kart.speed;
+  kart.y+=sin(kart.angle)*kart.speed;
+  kart.x=constrain(kart.x,0,W); kart.y=constrain(kart.y,0,H);
+  kart.onTrack=isOnTrack(kart.x,kart.y);
+
+  if (kart.speed>0.5 && frameCount%(kart.onTrack?3:1)===0)
+    spawnParticle(kart.x,kart.y,kart.angle);
+
+  kart.trackIndex=closestTrackIndex(kart.x,kart.y);
+
+  // Laps
+  let s=TRACK_PTS[0], d=dist(kart.x,kart.y,s.x,s.y);
+  if (d<TRACK_WIDTH/2 && kart.speed>0.5) {
+    if (!kart.lastCheckpoint) {
+      kart.lapCount++; kart.lastCheckpoint=true;
+      let lapTime=millis()-lapStartTime;
+      lapTimes.push(lapTime);
+      if (lapTime<bestLapTime) bestLapTime=lapTime;
+      lapStartTime=millis();
+      lapFlash=1.0; // activar flash
+      if (kart.lapCount>=TOTAL_LAPS) { finalPosition=getRacePosition(); gameState='finished'; }
+    }
+  } else if (d>TRACK_WIDTH) { kart.lastCheckpoint=false; }
+}
+
+// ─────────────────────────────────────────────
+//  RIVALES
+// ─────────────────────────────────────────────
+function updateRivals() {
+  for (let r of rivals) {
+    if (r.finished) continue;
+    let target=TRACK_PTS[r.targetIdx];
+    let dx=target.x-r.x, dy=target.y-r.y;
+    let distToTarget=sqrt(dx*dx+dy*dy);
+    let desiredAngle=atan2(dy,dx);
+    let angleDiff=desiredAngle-r.angle;
+    while (angleDiff>PI) angleDiff-=TWO_PI;
+    while (angleDiff<-PI) angleDiff+=TWO_PI;
+    r.angle+=angleDiff*0.12;
+    r.speed+=0.08; r.speed*=0.95;
+    r.speed=constrain(r.speed,0,r.maxSpeed);
+    r.x+=cos(r.angle)*r.speed; r.y+=sin(r.angle)*r.speed;
+    if (distToTarget<8) {
+      r.targetIdx=(r.targetIdx+1)%TRACK_PTS.length;
+      if (r.targetIdx===1) { r.lapCount++; if (r.lapCount>=TOTAL_LAPS) r.finished=true; }
+    }
+    r.trackIndex=r.targetIdx;
+  }
+}
+
+function checkCollisions() {
+  for (let r of rivals) {
+    let d=dist(kart.x,kart.y,r.x,r.y);
+    if (d<24) {
+      kart.speed*=0.4;
+      let pa=atan2(kart.y-r.y,kart.x-r.x);
+      kart.x+=cos(pa)*6; kart.y+=sin(pa)*6;
+      r.speed*=0.7;
+    }
+  }
+}
+
+function getRacePosition() {
+  let total=TRACK_PTS.length;
+  let all=[
+    {name:'TU', progress:kart.lapCount*total+kart.trackIndex},
+    ...rivals.map(r=>({name:r.num, progress:r.lapCount*total+r.trackIndex}))
+  ];
+  all.sort((a,b)=>b.progress-a.progress);
+  return all.findIndex(r=>r.name==='TU')+1;
+}
+
+function formatTime(ms) {
+  if (ms===Infinity||ms===0) return '--:--.---';
+  return nf(floor(ms/60000),1)+':'+nf(floor((ms%60000)/1000),2)+'.'+nf(floor(ms%1000),3);
+}
+
+// ─────────────────────────────────────────────
+//  FONDO MEJORADO
+// ─────────────────────────────────────────────
+function drawBackground() {
+  // Cielo con degradado más rico
+  for (let y=0; y<H*0.55; y++) {
+    let t=y/(H*0.55);
+    let r=lerp(15,35,t), g=lerp(20,55,t), b=lerp(50,80,t);
+    stroke(r,g,b); line(0,y,W,y);
+  }
+
+  // Suelo verde texturizado
+  noStroke();
+  fill(35,85,35); rect(W/2,H*0.75,W,H*0.55);
+
+  // Variación de hierba
+  randomSeed(12);
+  for (let i=0; i<120; i++) {
+    let gx=random(W), gy=random(H*0.45,H);
+    let bright=random(30,55);
+    fill(bright,bright+50,bright,180);
+    ellipse(gx,gy,random(2,6),random(2,4));
+  }
+
+  // Nubes simples
+  drawClouds();
+  drawMountains();
+}
+
+function drawClouds() {
+  randomSeed(33);
+  noStroke();
+  for (let i=0; i<5; i++) {
+    let cx=random(W), cy=random(40,160);
+    // mover lentamente
+    cx=(cx+frameCount*0.05*random(0.3,0.8))%W;
+    let alpha=random(120,180);
+    fill(240,245,255,alpha);
+    ellipse(cx,     cy,    random(60,100), random(25,40));
+    ellipse(cx+30,  cy-10, random(40,70),  random(20,35));
+    ellipse(cx-25,  cy-5,  random(35,55),  random(18,30));
+  }
+}
+
+function drawMountains() {
+  // Montañas lejanas (azuladas)
+  noStroke();
+  fill(55,70,110,200);
+  drawMountain(100,320,200); drawMountain(320,300,170);
+  drawMountain(550,315,190); drawMountain(740,310,160);
+  // Montañas medias (más oscuras)
+  fill(40,55,85,220);
+  drawMountain(200,345,150); drawMountain(450,335,140);
+  drawMountain(670,340,155);
+  // Nieve en picos
+  fill(230,240,255,200);
+  snowPeak(100,320,200); snowPeak(320,300,170);
+  snowPeak(550,315,190); snowPeak(740,310,160);
+}
+
+function drawMountain(x,baseY,size) {
+  triangle(x,baseY, x-size,baseY+size*0.65, x+size,baseY+size*0.65);
+}
+function snowPeak(x,baseY,size) {
+  triangle(x,baseY, x-size*0.28,baseY+size*0.22, x+size*0.28,baseY+size*0.22);
+}
+
+// ─────────────────────────────────────────────
+//  PISTA MEJORADA
+// ─────────────────────────────────────────────
+function drawTrack() {
+  noFill();
+
+  // Sombra exterior
+  stroke(0,0,0,60); strokeWeight(TRACK_WIDTH+28);
+  drawTrackFromPoints();
+
+  // Borde exterior (kerb rojo/blanco)
+  drawKerb(TRACK_WIDTH+8);
+
+  // Asfalto principal — con ligera textura
+  stroke(48,48,52); strokeWeight(TRACK_WIDTH);
+  drawTrackFromPoints();
+
+  // Asfalto interior más claro (líneas de desgaste)
+  stroke(58,58,64,120); strokeWeight(TRACK_WIDTH-20);
+  drawTrackFromPoints();
+
+  // Borde interior (kerb)
+  drawKerb(TRACK_WIDTH-8);
+
+  // Línea central punteada
+  stroke(255,230,0,200); strokeWeight(2.5);
+  for (let i=0; i<TRACK_PTS.length; i+=2) {
+    let a=TRACK_PTS[i], b=TRACK_PTS[(i+1)%TRACK_PTS.length];
+    line(a.x,a.y,b.x,b.y);
+  }
+
+  drawInnerGrass();
+}
+
+function drawKerb(width) {
+  // Kerb alternado rojo/blanco
+  let segLen = 6;
+  for (let i=0; i<TRACK_PTS.length; i++) {
+    let pt=TRACK_PTS[i];
+    let isRed = floor(i/segLen)%2===0;
+    stroke(isRed?color(220,30,30,180):color(240,240,240,180));
+    strokeWeight(width);
+    let next=TRACK_PTS[(i+1)%TRACK_PTS.length];
+    line(pt.x,pt.y,next.x,next.y);
+  }
+}
+
+function drawTrackFromPoints() {
+  beginShape(); noFill();
+  for (let pt of TRACK_PTS) vertex(pt.x,pt.y);
+  endShape(CLOSE);
+}
+
+function drawInnerGrass() {
+  // Hierba interior con degradado
+  noStroke();
+  fill(38,105,38); ellipse(400,335,430,320);
+  fill(45,118,45); ellipse(400,335,390,280);
+  fill(52,130,52); ellipse(400,335,340,240);
+
+  // Flores y puntos decorativos
+  randomSeed(99);
+  for (let i=0; i<40; i++) {
+    let a=random(TWO_PI), rx=random(10,170), ry=random(10,125);
+    let fx=400+cos(a)*rx, fy=335+sin(a)*ry;
+    fill(random([
+      color(255,255,100,180), // flores amarillas
+      color(255,100,100,160), // flores rojas
+      color(60,160,60,200),   // hierba oscura
+    ]));
+    ellipse(fx,fy,random(2,6),random(2,6));
+  }
+
+  // Árboles decorativos
+  drawTrees();
+}
+
+function drawTrees() {
+  for (let t of treePositions) {
+    let s=t.size;
+    // Tronco
+    noStroke(); fill(120,80,40);
+    rect(t.x, t.y+s*0.8, s*0.4, s*0.9);
+    // Copa
+    fill(t.type===0 ? color(30,130,30) : color(20,110,50));
+    ellipse(t.x, t.y, s*2, s*2.2);
+    fill(t.type===0 ? color(50,160,50,180) : color(40,140,60,180));
+    ellipse(t.x-s*0.3, t.y-s*0.3, s*1.2, s*1.2);
+  }
+}
+
+function drawFinishLine() {
+  let s=TRACK_PTS[0], size=TRACK_WIDTH/2;
+  // Banderines sobre la línea
+  push(); translate(s.x, s.y-size-10);
+  noStroke(); fill(255,50,50); ellipse(-15,0,14,10);
+  fill(255,255,255); ellipse(0,0,14,10);
+  fill(255,50,50); ellipse(15,0,14,10);
+  pop();
+  // Cuadros
+  let cols=6, cellW=(size*2)/cols, cellH=12, rows=3;
+  push(); translate(s.x,s.y);
+  for (let r=0; r<rows; r++)
+    for (let c=0; c<cols; c++) {
+      noStroke(); fill((r+c)%2===0?255:10);
+      rect(-size+c*cellW+cellW/2,-rows*cellH/2+r*cellH+cellH/2,cellW,cellH);
+    }
+  pop();
+}
+
+// ─────────────────────────────────────────────
+//  KART + RIVAL DIBUJO (sin cambios)
+// ─────────────────────────────────────────────
+function drawKart() {
+  push();
+  translate(kart.x,kart.y); rotate(kart.angle);
+  let W2=kart.width, H2=kart.height;
+  noStroke(); fill(0,0,0,70); ellipse(4,6,W2+10,H2+6);
+  fill(230,30,30); stroke(170,10,10); strokeWeight(1.5); rect(0,0,W2,H2,5);
+  fill(190,15,15); noStroke(); rect(0,-2,W2*0.55,H2*0.65,4);
+  fill(160,220,255,210); rect(2,-2,W2*0.35,H2*0.4,2);
+  // Detalle lateral
+  fill(255,60,60,150); rect(-W2*0.3,2,W2*0.15,H2*0.4,2);
+  drawWheel(-W2*0.38,H2*0.45); drawWheel(W2*0.38,H2*0.45);
+  drawWheel(-W2*0.38,-H2*0.45); drawWheel(W2*0.38,-H2*0.45);
+  fill(255); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('1',0,-1);
+  pop();
+}
+
+function drawRival(r) {
+  push();
+  translate(r.x,r.y); rotate(r.angle);
+  let W2=r.width, H2=r.height, [cr,cg,cb]=r.col;
+  noStroke(); fill(0,0,0,70); ellipse(4,6,W2+10,H2+6);
+  fill(cr,cg,cb); stroke(cr*0.7,cg*0.7,cb*0.7); strokeWeight(1.5); rect(0,0,W2,H2,5);
+  fill(cr*0.7,cg*0.7,cb*0.7); noStroke(); rect(0,-2,W2*0.55,H2*0.65,4);
+  fill(160,220,255,180); rect(2,-2,W2*0.35,H2*0.4,2);
+  drawWheel(-W2*0.38,H2*0.45); drawWheel(W2*0.38,H2*0.45);
+  drawWheel(-W2*0.38,-H2*0.45); drawWheel(W2*0.38,-H2*0.45);
+  fill(255); noStroke(); textSize(8); textAlign(CENTER,CENTER); text(r.num,0,-1);
+  pop();
+}
+
+function drawWheel(wx,wy) {
+  push(); translate(wx,wy);
+  fill(25,25,25); noStroke(); rect(0,0,10,7,2);
+  fill(90,90,90); ellipse(0,0,5,5);
+  pop();
+}
+
+// ─────────────────────────────────────────────
+//  HUD MEJORADO
+// ─────────────────────────────────────────────
+function drawHUD() {
+  // ── Velocímetro (esquina inferior izquierda) ──
+  let vx=90, vy=H-38;
+  noStroke(); fill(0,0,0,200);
+  rect(vx,vy,160,52,10);
+  stroke(255,107,0,150); strokeWeight(1);
+  rect(vx,vy,160,52,10);
+
+  let spd=kart.speed, displaySpeed=floor(spd*40);
+  // Número grande
+  noStroke(); fill(255,210,0); textSize(30); textAlign(RIGHT,CENTER);
+  text(displaySpeed, vx+42, vy-4);
+  fill(180,180,180); textSize(10); textAlign(LEFT,CENTER);
+  text('km/h', vx+46, vy-4);
+
+  // Barra velocidad con gradiente de color
+  let barW=138;
+  noStroke(); fill(20,20,20,200); rect(vx,vy+16,barW,10,4);
+  let pct=spd/kart.maxSpeed;
+  let barCol = pct<0.5 ? lerpColor(color(50,200,80),color(255,200,0),pct*2)
+                       : lerpColor(color(255,200,0),color(255,60,0),(pct-0.5)*2);
+  let filled=map(spd,0,kart.maxSpeed,0,barW-4);
+  fill(barCol); rect(vx-barW/2+2+filled/2,vy+16,filled,8,3);
+
+  // ── Panel superior central (LAP + POS + TIEMPO) ──
+  let px=W/2, py=22;
+  noStroke(); fill(0,0,0,190);
+  rect(px,py,340,36,8);
+  stroke(255,107,0,100); strokeWeight(1);
+  rect(px,py,340,36,8);
+
+  // Vueltas
+  noStroke(); fill(255,107,0); textSize(10); textAlign(LEFT,CENTER);
+  text('VUELTA', px-165, py-6);
+  fill(255,255,255); textSize(20); textAlign(LEFT,CENTER);
+  text(min(kart.lapCount,TOTAL_LAPS)+'/'+TOTAL_LAPS, px-165, py+8);
+
+  // Posición
+  let pos=getRacePosition();
+  let posStr=pos+['ST','ND','RD','TH'][min(pos-1,3)];
+  let posColors=[color(255,215,0),color(200,200,200),color(200,120,60),color(180,80,80)];
+  fill(posColors[min(pos-1,3)]); textSize(22); textAlign(CENTER,CENTER);
+  text(posStr, px, py);
+
+  // Tiempo vuelta actual
+  if (gameState==='playing') {
+    let curLap=millis()-lapStartTime;
+    fill(200,200,200); textSize(9); textAlign(RIGHT,CENTER);
+    text('TIEMPO', px+165, py-6);
+    fill(255); textSize(14); textAlign(RIGHT,CENTER);
+    text(formatTime(curLap), px+165, py+8);
+  }
+
+  // Mejor vuelta (abajo del panel central)
+  if (bestLapTime<Infinity) {
+    noStroke(); fill(0,0,0,160); rect(px,py+30,200,18,4);
+    fill(100,255,150); textSize(9); textAlign(CENTER,CENTER);
+    text('★ MEJOR VUELTA: '+formatTime(bestLapTime), px, py+30);
+  }
+
+  // Fuera de pista
+  if (!kart.onTrack) {
+    let pulse=map(sin(frameCount*0.2),-1,1,0.7,1);
+    fill(255,80,0,220*pulse); textSize(14); textAlign(CENTER,CENTER);
+    text('⚠  FUERA DE PISTA  ⚠', W/2, 72);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CÁMARA
+// ─────────────────────────────────────────────
+function drawCameraFeed() {
+  let cw=140, ch=105;
+  let x=W-cw-15, y=H-ch-55;
+  push(); rectMode(CORNER);
+  noStroke(); fill(0,0,0,200); rect(x-3,y-3,cw+6,ch+22);
+  translate(x+cw,y); scale(-1,1); image(video,0,0,cw,ch);
+  pop();
+  push(); rectMode(CORNER);
+  noFill(); stroke(255,107,0); strokeWeight(2); rect(x,y,cw,ch,3);
+  noStroke(); fill(255,107,0); textSize(9); textAlign(LEFT);
+  text('● CAM',x+2,y+ch+14);
+  pop();
+}
+
+// ─────────────────────────────────────────────
+//  LABEL GESTO
+// ─────────────────────────────────────────────
+function drawGestureLabel() {
+  if (!modelReady) return;
+  let cw=140, cx=W-cw/2-10, cy=H-20;
+  let col,txt;
+  switch(currentLabel) {
+    case 'Mizquierda': col=color(80,200,255);  txt='< IZQUIERDA'; break;
+    case 'Mderecha':   col=color(255,180,0);   txt='> DERECHA';   break;
+    case 'frenar':     col=color(255,60,60);   txt='! FRENAR';    break;
+    default:           col=color(100,255,100); txt='— ACELERAR';  break;
+  }
+  noStroke(); fill(0,0,0,160); rect(cx,cy,cw,18,4);
+  fill(col); textSize(10); textAlign(CENTER,CENTER); text(txt,cx,cy);
+  fill(30,30,30,180); rect(cx,cy+12,cw,6,3);
+  let bw=map(confidence,0,1,0,cw-4);
+  fill(col); rect(cx-cw/2+2+bw/2,cy+12,bw,4,3);
+}
+
+// ─────────────────────────────────────────────
+//  BOTÓN RESET
+// ─────────────────────────────────────────────
+function drawResetButton() {
+  if (gameState==='finished') return;
+  let bx=W-55,by=25,bw=90,bh=28;
+  let hovered=mouseX>bx-bw/2&&mouseX<bx+bw/2&&mouseY>by-bh/2&&mouseY<by+bh/2;
+  noStroke(); fill(hovered?color(255,140,0):color(150,60,0));
+  rect(bx,by,bw,bh,5);
+  stroke(255,107,0,150); strokeWeight(1); noFill(); rect(bx,by,bw,bh,5);
+  noStroke(); fill(255); textSize(11); textAlign(CENTER,CENTER); text('↺ RESET',bx,by);
+}
+
+function mousePressed() {
+  let bx=W-55,by=25,bw=90,bh=28;
+  if (gameState!=='finished'&&mouseX>bx-bw/2&&mouseX<bx+bw/2&&mouseY>by-bh/2&&mouseY<by+bh/2) { resetGame(); return; }
+  if (gameState==='finished') {
+    let fbx=W/2,fby=H/2+148,fbw=160,fbh=34;
+    if (mouseX>fbx-fbw/2&&mouseX<fbx+fbw/2&&mouseY>fby-fbh/2&&mouseY<fby+fbh/2) resetGame();
+  }
+}
+
+// ─────────────────────────────────────────────
+//  PANTALLA DE FIN
+// ─────────────────────────────────────────────
+function drawFinishScreen() {
+  noStroke(); fill(0,0,0,210); rect(W/2,H/2,W,H);
+  let pos=finalPosition;
+  let medals=['🏆','🥈','🥉','💀'];
+  let posStr=pos+['ST','ND','RD','TH'][min(pos-1,3)];
+  let posColors=[color(255,215,0),color(200,200,200),color(200,120,60),color(180,60,60)];
+  let posCol=posColors[min(pos-1,3)];
+
+  fill(15,18,30,250); stroke(255,107,0); strokeWeight(2);
+  rect(W/2,H/2,440,350,14);
+
+  fill(255,107,0); noStroke(); textSize(13); textAlign(CENTER,CENTER);
+  text('— CARRERA TERMINADA —', W/2, H/2-148);
+
+  fill(posCol); textSize(72); text(posStr, W/2-45, H/2-75);
+  textSize(52); text(medals[min(pos-1,3)], W/2+75, H/2-75);
+
+  let msgs=['¡GANASTE LA CARRERA!','Muy buen resultado','Casi llegas al podio','Sigue practicando'];
+  fill(255); textSize(15); text(msgs[min(pos-1,3)], W/2, H/2-18);
+
+  stroke(255,107,0,80); strokeWeight(1);
+  line(W/2-200,H/2+10,W/2+200,H/2+10);
+
+  noStroke();
+  let totalTime=lapTimes.reduce((a,b)=>a+b,0);
+  fill(160,160,160); textSize(11); textAlign(LEFT,CENTER);
+  text('TIEMPO TOTAL', W/2-195,H/2+32);
+  fill(255); textSize(14); textAlign(RIGHT,CENTER);
+  text(formatTime(totalTime),W/2+195,H/2+32);
+
+  fill(160,160,160); textSize(11); textAlign(LEFT,CENTER);
+  text('MEJOR VUELTA',W/2-195,H/2+58);
+  fill(100,255,150); textSize(14); textAlign(RIGHT,CENTER);
+  text(formatTime(bestLapTime)+' ★',W/2+195,H/2+58);
+
+  for (let i=0;i<lapTimes.length;i++) {
+    let isBest=lapTimes[i]===bestLapTime;
+    fill(isBest?color(100,255,150):color(200,200,200));
+    textSize(11); textAlign(LEFT,CENTER);
+    text('VUELTA '+(i+1),W/2-195,H/2+86+i*22);
+    textAlign(RIGHT,CENTER);
+    text(formatTime(lapTimes[i])+(isBest?' ★':''),W/2+195,H/2+86+i*22);
+  }
+
+  let bx=W/2,by=H/2+155,bw=170,bh=36;
+  let hovered=mouseX>bx-bw/2&&mouseX<bx+bw/2&&mouseY>by-bh/2&&mouseY<by+bh/2;
+  noStroke(); fill(hovered?color(255,140,0):color(150,60,0));
+  rect(bx,by,bw,bh,7);
+  stroke(255,107,0,150); strokeWeight(1); noFill(); rect(bx,by,bw,bh,7);
+  noStroke(); fill(255); textSize(13); textAlign(CENTER,CENTER);
+  text('↺ JUGAR DE NUEVO',bx,by);
+}
+
+// ─────────────────────────────────────────────
+//  PANTALLA DE CARGA
+// ─────────────────────────────────────────────
+function drawLoadingScreen() {
+  background(6,8,16);
+  // Logo titulo
+  fill(255,107,0); textSize(36); textAlign(CENTER,CENTER);
+  text('MARIO KART', W/2, H/2-80);
+  fill(255,200,0); textSize(16);
+  text('ML5 EDITION', W/2, H/2-45);
+  // Separador
+  stroke(255,107,0,100); strokeWeight(1);
+  line(W/2-120,H/2-25,W/2+120,H/2-25);
+  // Estado
+  noStroke(); fill(200,200,200); textSize(14);
+  text('Cargando modelo y camara...', W/2, H/2+10);
+  fill(120,120,120); textSize(11);
+  text('(puede tardar unos segundos)', W/2, H/2+35);
+  // Animación
+  fill(255,107,0);
+  let dots=floor(frameCount/15)%4;
+  text('·'.repeat(dots*2||1), W/2, H/2+60);
+}
+
+// ─────────────────────────────────────────────
+//  CUENTA REGRESIVA
+// ─────────────────────────────────────────────
+function drawCountdown() {
+  fill(0,0,0,160); noStroke(); rect(W/2,H/2,W,H);
+  let displayNum=countdownValue>0?str(countdownValue):'¡GO!';
+  let pulse=map(sin(frameCount*0.25),-1,1,0.88,1.12);
+  // Sombra del número
+  fill(0,0,0,100); textSize(130*pulse); textAlign(CENTER,CENTER);
+  text(displayNum,W/2+4,H/2+4);
+  // Número principal
+  fill(countdownValue>0?color(255,200,0):color(100,255,100));
+  textSize(130*pulse);
+  text(displayNum,W/2,H/2);
+  fill(255,255,255,200); textSize(16);
+  text('PREPÁRATE  ·  '+TOTAL_LAPS+' VUELTAS',W/2,H/2+95);
+}
+
+// ─────────────────────────────────────────────
+//  PARTÍCULAS
+// ─────────────────────────────────────────────
+function spawnParticle(x,y,angle) {
+  let a=angle+PI+random(-0.5,0.5), spd=random(0.5,2.5);
+  let col=kart.onTrack?color(190,190,190,160):color(80,180,80,200);
+  particles.push({x,y,vx:cos(a)*spd,vy:sin(a)*spd,life:1.0,size:random(3,9),col});
+}
+function updateAndDrawParticles() {
+  for (let i=particles.length-1;i>=0;i--) {
+    let pt=particles[i];
+    pt.x+=pt.vx; pt.y+=pt.vy; pt.vx*=0.94; pt.vy*=0.94;
+    pt.life-=0.025; pt.size*=0.97;
+    if (pt.life<=0) { particles.splice(i,1); continue; }
+    noStroke();
+    fill(red(pt.col),green(pt.col),blue(pt.col),alpha(pt.col)*pt.life);
+    ellipse(pt.x,pt.y,pt.size,pt.size);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  UTILIDADES PISTA
+// ─────────────────────────────────────────────
+function buildTrackPoints(count) {
+  let pts=[],n=TRACK_CTRL.length;
+  for (let i=0;i<count;i++) {
+    let t=i/count,st=t*n,idx=Math.floor(st),f=st-idx;
+    let p0=TRACK_CTRL[(idx-1+n)%n],p1=TRACK_CTRL[idx%n];
+    let p2=TRACK_CTRL[(idx+1)%n],p3=TRACK_CTRL[(idx+2)%n];
+    pts.push({x:catmullRom(p0.x,p1.x,p2.x,p3.x,f),y:catmullRom(p0.y,p1.y,p2.y,p3.y,f)});
+  }
+  return pts;
+}
+function catmullRom(p0,p1,p2,p3,t) {
+  return 0.5*((2*p1)+(-p0+p2)*t+(2*p0-5*p1+4*p2-p3)*t*t+(-p0+3*p1-3*p2+p3)*t*t*t);
+}
+function isOnTrack(x,y) {
+  let minDist=Infinity;
+  for (let pt of TRACK_PTS) { let d=dist(x,y,pt.x,pt.y); if(d<minDist) minDist=d; }
+  return minDist<TRACK_WIDTH/2;
+}
+function closestTrackIndex(x,y) {
+  let minDist=Infinity,idx=0;
+  for (let i=0;i<TRACK_PTS.length;i++) {
+    let d=dist(x,y,TRACK_PTS[i].x,TRACK_PTS[i].y);
+    if(d<minDist){minDist=d;idx=i;}
+  }
+  return idx;
+}
+</script>
+</body>
+</html>
